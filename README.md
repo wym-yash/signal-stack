@@ -148,3 +148,4 @@ c) Monday Morning Brief:
 
    - Verify the brief renders its sections in the UI (reading markdown_content),appears in brief history, and supports "Copy markdown" and "Download .md".
 
+The google drive link with all demo: https://drive.google.com/drive/folders/1Ti5QAy2y0p11TRhfq-ism4Ny-vxyOPrR?usp=drive_link
