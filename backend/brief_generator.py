@@ -8,6 +8,19 @@ from db import get_company, get_conn, utc_now
 from llm_client import FreeLLMClient
 from signal_stack import list_sources
 
+MAX_SIGNALS_FOR_BRIEF = 10
+MAX_SUMMARY_CHARS = 240
+MAX_SNIPPET_CHARS = 200
+MAX_CONTEXT_CHARS = 900
+MAX_PROFILE_CHARS = 600
+
+
+def _clip(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
 
 class ExecutiveTopItem(BaseModel):
     headline: str
@@ -187,6 +200,126 @@ def _render_brief_markdown(company_name: str, data: MondayMorningBriefSchema) ->
     return "\n".join(lines).strip()
 
 
+def _build_fallback_brief(
+    company: dict[str, Any],
+    compact_signals: list[dict[str, Any]],
+    reason: str,
+) -> MondayMorningBriefSchema:
+    company_name = company["name"]
+    exec_items: list[ExecutiveTopItem] = []
+    opportunities: list[OpportunityItem] = []
+    risks: list[RiskThreatItem] = []
+    actions: list[RecommendedActionItem] = []
+    watch_items: list[WatchlistItem] = []
+    appendix: list[AppendixEntry] = []
+
+    by_category: dict[str, list[str]] = {
+        "Customers": [],
+        "Competitors": [],
+        "Market": [],
+        "Internal": [],
+    }
+
+    for sig in compact_signals[:MAX_SIGNALS_FOR_BRIEF]:
+        title = _clip(sig.get("title") or "Recorded signal", 90)
+        summary = _clip(sig.get("summary") or sig.get("evidence_snippet") or "", 180)
+        snippet = _clip(sig.get("evidence_snippet") or summary, 160)
+        url = sig.get("source_url") or company.get("website") or ""
+        source_name = _clip(sig.get("source_name") or url or "Signal Source", 70)
+        status = sig.get("verified_status") or "unverified"
+        cat = sig.get("category") or "Market"
+
+        if len(exec_items) < 5:
+            exec_items.append(
+                ExecutiveTopItem(
+                    headline=title,
+                    why_it_matters=summary or f"Recorded under {cat} for {company_name}.",
+                    evidence_link=url,
+                    verification_status=status,
+                )
+            )
+
+        bullet = f"{title}: {summary}" if summary else title
+        if cat in by_category and len(by_category[cat]) < 3:
+            by_category[cat].append(bullet)
+
+        stance = (sig.get("signal_stance") or "neutral").lower()
+        if stance == "opportunity" and len(opportunities) < 3:
+            opportunities.append(
+                OpportunityItem(
+                    title=title,
+                    evidence=snippet or title,
+                    impact=summary or f"Potential upside in {cat}.",
+                    next_step=_clip(sig.get("recommended_action") or "Validate with product and GTM leads.", 120),
+                    priority="Medium",
+                )
+            )
+        elif stance == "threat" and len(risks) < 3:
+            risks.append(
+                RiskThreatItem(
+                    title=title,
+                    evidence=snippet or title,
+                    possible_impact=summary or f"Potential competitive or market risk in {cat}.",
+                    urgency="Medium",
+                )
+            )
+
+        if len(actions) < 3:
+            actions.append(
+                RecommendedActionItem(
+                    action=_clip(sig.get("recommended_action") or f"Review '{title}' and verify source details", 120),
+                    reason=summary or f"High-ranked signal in {cat}.",
+                    suggested_owner="Strategy / Product Lead",
+                    priority="P2",
+                )
+            )
+
+        if len(watch_items) < 3:
+            watch_items.append(
+                WatchlistItem(
+                    topic=title,
+                    early_signal=snippet or summary or title,
+                    what_to_watch_next="Track follow-up announcements, customer reaction, and competitor responses.",
+                )
+            )
+
+        appendix.append(
+            AppendixEntry(
+                source_name=source_name,
+                direct_link=url,
+                published_date=str(sig.get("published_date") or ""),
+                discovery_date=str(sig.get("discovered_at") or ""),
+                evidence_snippet=snippet,
+                verification_status=status,
+                reliability_score=float(sig.get("reliability_score") or 0.5),
+                evidence_strength_score=float(sig.get("evidence_strength_score") or 0.5),
+                strategic_relevance_score=float(sig.get("strategic_relevance_score") or 0.5),
+            )
+        )
+
+    fallback_note = f"Fallback brief generated from stored signals ({_clip(reason, 120)})."
+
+    return MondayMorningBriefSchema(
+        title=f"{company_name} — Monday Morning Intelligence Brief",
+        executive_summary=exec_items,
+        customer_signals_status_note="" if by_category["Customers"] else f"No meaningful customer signals in current window. {fallback_note}",
+        customer_signals=by_category["Customers"],
+        competitor_intelligence_status_note="" if by_category["Competitors"] else f"No meaningful competitor signals in current window. {fallback_note}",
+        competitor_intelligence=by_category["Competitors"],
+        market_intelligence_status_note="" if by_category["Market"] else f"No meaningful market signals in current window. {fallback_note}",
+        market_intelligence=by_category["Market"],
+        internal_intelligence_status_note="" if by_category["Internal"] else f"No meaningful internal signals in current window. {fallback_note}",
+        internal_intelligence=by_category["Internal"],
+        opportunities=opportunities,
+        opportunities_note="" if opportunities else fallback_note,
+        risks_and_threats=risks,
+        risks_note="" if risks else fallback_note,
+        recommended_actions=actions,
+        watch_list=watch_items,
+        source_appendix=appendix,
+    )
+
+
 def generate_monday_morning_brief(
     company_id: int,
     brief_type: str = "weekly",
@@ -196,7 +329,7 @@ def generate_monday_morning_brief(
     if not company:
         raise ValueError(f"Company with id={company_id} not found.")
 
-    signals = list_signals(company_id=company_id, limit=80)
+    signals = list_signals(company_id=company_id, limit=MAX_SIGNALS_FOR_BRIEF)
     sources = list_sources(company_id=company_id)
     source_map = {s["id"]: s for s in sources}
 
@@ -204,52 +337,52 @@ def generate_monday_morning_brief(
         {
             "id": sig["id"],
             "category": sig["category"],
-            "competitor_name": sig["competitor_name"],
-            "title": sig["title"],
-            "summary": sig["summary"],
-            "evidence_snippet": sig["evidence_snippet"],
-            "source_url": sig["source_url"],
-            "source_name": source_map.get(sig["source_id"], {}).get("name", sig["source_url"]),
-            "published_date": sig["published_date"] or "",
-            "discovered_at": sig["discovered_at"],
-            "signal_stance": sig["signal_stance"],
-            "total_rank_score": sig["total_rank_score"],
-            "reliability_score": sig["credibility_score"],
-            "evidence_strength_score": sig["evidence_strength_score"],
-            "strategic_relevance_score": sig["relevance_score"],
-            "verified_status": sig["verified_status"],
-            "interpretation": sig["interpretation"],
-            "recommended_action": sig["recommended_action"],
+            "competitor_name": _clip(sig.get("competitor_name"), 50),
+            "title": _clip(sig.get("title"), 95),
+            "summary": _clip(sig.get("summary"), MAX_SUMMARY_CHARS),
+            "evidence_snippet": _clip(sig.get("evidence_snippet"), MAX_SNIPPET_CHARS),
+            "source_url": sig.get("source_url") or "",
+            "source_name": _clip(source_map.get(sig["source_id"], {}).get("name", sig.get("source_url") or ""), 60),
+            "published_date": sig.get("published_date") or "",
+            "discovered_at": sig.get("discovered_at") or "",
+            "signal_stance": sig.get("signal_stance") or "neutral",
+            "total_rank_score": round(float(sig.get("total_rank_score") or 0.0), 3),
+            "reliability_score": round(float(sig.get("credibility_score") or 0.5), 2),
+            "evidence_strength_score": round(float(sig.get("evidence_strength_score") or 0.5), 2),
+            "strategic_relevance_score": round(float(sig.get("relevance_score") or 0.5), 2),
+            "verified_status": sig.get("verified_status") or "unverified",
+            "interpretation": _clip(sig.get("interpretation"), 140),
+            "recommended_action": _clip(sig.get("recommended_action"), 140),
         }
         for sig in signals
     ]
 
     llm_client = llm or FreeLLMClient()
     system_prompt = (
-        "You are an executive chief-of-staff intelligence analyst writing a Monday Morning Intelligence Brief "
-        "for a founder/CEO. Ground every claim strictly in the provided intelligence signals and company profile. "
-        "Never fabricate developments, statistics, dates, or quotes. "
-        "If a category (Customer Signals, Competitor Intelligence, Market Intelligence, or Internal Business Intelligence) "
-        "has no meaningful development in the provided data, explicitly say so in that category's status note and leave "
-        "its list empty—never manufacture filler items. "
-        "Clearly distinguish verified facts/evidence from strategic interpretation."
+        "You are an executive chief-of-staff intelligence analyst writing a concise Monday Morning Intelligence Brief. "
+        "Ground every claim strictly in the provided signals and company profile. "
+        "Never fabricate facts, numbers, dates, or quotes. "
+        "If a category has no meaningful item in the provided signals, note that briefly and keep its list empty."
     )
     user_prompt = (
-        f"Company: {company['name']} ({company['website']})\n"
-        f"Industry: {company.get('industry') or 'Unknown'}\n"
-        f"Profile Summary: {company.get('profile_summary') or ''}\n"
-        f"Business Context: {company.get('business_context') or ''}\n"
-        f"Verified Facts: {json.dumps(company.get('verified_facts', []))}\n"
-        f"Assumptions: {json.dumps(company.get('assumptions', []))}\n"
-        f"Collected Signals ({len(compact_signals)} total): {json.dumps(compact_signals)}"
+        f"Company: {_clip(company['name'], 80)} ({_clip(company['website'], 100)})\n"
+        f"Industry: {_clip(company.get('industry') or 'Unknown', 80)}\n"
+        f"Profile Summary: {_clip(company.get('profile_summary') or '', MAX_PROFILE_CHARS)}\n"
+        f"Business Context: {_clip(company.get('business_context') or '', MAX_CONTEXT_CHARS)}\n"
+        f"Verified Facts: {json.dumps([_clip(x, 120) for x in (company.get('verified_facts') or [])[:6]])}\n"
+        f"Assumptions: {json.dumps([_clip(x, 120) for x in (company.get('assumptions') or [])[:6]])}\n"
+        f"Top Signals ({len(compact_signals)}): {json.dumps(compact_signals)}"
     )
 
-    structured = llm_client.generate_structured(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        schema_model=MondayMorningBriefSchema,
-        temperature=0.2,
-    )
+    try:
+        structured = llm_client.generate_structured(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema_model=MondayMorningBriefSchema,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        structured = _build_fallback_brief(company, compact_signals, str(exc))
 
     markdown_content = _render_brief_markdown(company["name"], structured)
     now = utc_now()

@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-DB_PATH = Path(os.getenv("DATABASE_PATH", "signal_stack.db"))
+_raw_db_path = (os.getenv("DATABASE_PATH") or "").strip()
+DB_PATH = Path(_raw_db_path or "signal_stack.db")
 
 
 def utc_now() -> str:
@@ -15,8 +16,9 @@ def utc_now() -> str:
 
 @contextmanager
 def get_conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    if str(DB_PATH.parent) not in ("", "."):
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     try:
@@ -29,11 +31,18 @@ def get_conn():
         conn.close()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    cols = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS companies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id TEXT DEFAULT '',
             name TEXT NOT NULL,
             website TEXT NOT NULL,
             industry TEXT DEFAULT '',
@@ -145,28 +154,75 @@ def init_db() -> None:
             monthly_audit_day INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            company_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'allowed',
+            details TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         """)
+        _ensure_column(conn, "companies", "owner_id", "TEXT DEFAULT ''")
 
 
-def create_company(name: str, website: str, industry: str = "", business_context: str = "") -> dict[str, Any]:
+def _row_to_company(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    d["verified_facts"] = json.loads(d.pop("verified_facts_json") or "[]")
+    d["assumptions"] = json.loads(d.pop("assumptions_json") or "[]")
+    return d
+
+
+def create_company(
+    name: str,
+    website: str,
+    industry: str = "",
+    business_context: str = "",
+    owner_id: str = "",
+) -> dict[str, Any]:
+    clean_name = (name or "").strip()
+    clean_website = (website or "").strip()
+    clean_industry = (industry or "").strip()
+    clean_context = (business_context or "").strip()
+    clean_owner = (owner_id or "").strip()
+
+    if not clean_name:
+        raise ValueError("Company name is required.")
+    if not clean_website:
+        raise ValueError("Website is required.")
+
     now = utc_now()
     with get_conn() as conn:
         cur = conn.execute(
             """
-            INSERT INTO companies (name, website, industry, business_context, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO companies (owner_id, name, website, industry, business_context, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (name.strip(), website.strip(), industry.strip(), business_context.strip(), now, now),
+            (clean_owner, clean_name, clean_website, clean_industry, clean_context, now, now),
         )
         company_id = cur.lastrowid
         conn.execute(
             """
-            INSERT INTO settings (company_id)
+            INSERT OR IGNORE INTO settings (company_id)
             VALUES (?)
             """,
             (company_id,),
         )
-        return get_company(company_id)
+        if clean_context:
+            conn.execute(
+                """
+                INSERT INTO context_history (company_id, previous_context, new_context, change_summary, changed_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (company_id, "", clean_context, "Initial setup context", now),
+            )
+
+    company = get_company(company_id)
+    if not company:
+        raise RuntimeError(f"Company row could not be loaded after creation (id={company_id}).")
+    return company
 
 
 def get_company(company_id: int) -> Optional[dict[str, Any]]:
@@ -174,22 +230,22 @@ def get_company(company_id: int) -> Optional[dict[str, Any]]:
         row = conn.execute("SELECT * FROM companies WHERE id = ?", (company_id,)).fetchone()
         if not row:
             return None
-        d = dict(row)
-        d["verified_facts"] = json.loads(d.pop("verified_facts_json") or "[]")
-        d["assumptions"] = json.loads(d.pop("assumptions_json") or "[]")
-        return d
+        return _row_to_company(row)
 
 
-def list_companies() -> list[dict[str, Any]]:
+def list_companies(owner_id: Optional[str] = None) -> list[dict[str, Any]]:
+    clean_owner = (owner_id or "").strip()
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM companies ORDER BY id DESC").fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["verified_facts"] = json.loads(d.pop("verified_facts_json") or "[]")
-            d["assumptions"] = json.loads(d.pop("assumptions_json") or "[]")
-            out.append(d)
-        return out
+        if clean_owner:
+            rows = conn.execute(
+                "SELECT * FROM companies WHERE owner_id = ? ORDER BY id DESC",
+                (clean_owner,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM companies WHERE owner_id = '' ORDER BY id DESC"
+            ).fetchall()
+        return [_row_to_company(r) for r in rows]
 
 
 def update_company_research(
@@ -200,6 +256,7 @@ def update_company_research(
     industry: str = "",
 ) -> Optional[dict[str, Any]]:
     now = utc_now()
+    clean_industry = (industry or "").strip()
     with get_conn() as conn:
         conn.execute(
             """
@@ -215,8 +272,8 @@ def update_company_research(
                 profile_summary,
                 json.dumps(verified_facts),
                 json.dumps(assumptions),
-                industry,
-                industry,
+                clean_industry,
+                clean_industry,
                 now,
                 company_id,
             ),
@@ -226,6 +283,8 @@ def update_company_research(
 
 def update_business_context(company_id: int, new_context: str, change_summary: str = "") -> Optional[dict[str, Any]]:
     now = utc_now()
+    clean_context = (new_context or "").strip()
+    clean_summary = (change_summary or "").strip()
     with get_conn() as conn:
         row = conn.execute("SELECT business_context FROM companies WHERE id = ?", (company_id,)).fetchone()
         if not row:
@@ -236,7 +295,7 @@ def update_business_context(company_id: int, new_context: str, change_summary: s
             INSERT INTO context_history (company_id, previous_context, new_context, change_summary, changed_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (company_id, prev_context, new_context.strip(), change_summary.strip(), now),
+            (company_id, prev_context, clean_context, clean_summary, now),
         )
         conn.execute(
             """
@@ -244,7 +303,7 @@ def update_business_context(company_id: int, new_context: str, change_summary: s
             SET business_context = ?, updated_at = ?
             WHERE id = ?
             """,
-            (new_context.strip(), now, company_id),
+            (clean_context, now, company_id),
         )
     return get_company(company_id)
 
@@ -257,4 +316,21 @@ def log_job_run(company_id: Optional[int], job_type: str, status: str, details: 
             VALUES (?, ?, ?, ?, ?)
             """,
             (company_id, job_type, status, details, utc_now()),
+        )
+
+
+def log_audit_event(
+    actor_id: str,
+    action: str,
+    company_id: Optional[int] = None,
+    status: str = "allowed",
+    details: str = "",
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_logs (actor_id, action, company_id, status, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ((actor_id or "").strip(), action, company_id, status, details, utc_now()),
         )
